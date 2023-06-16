@@ -12,6 +12,7 @@ import net
 import pixel_display show *
 import pixel_display.texture show TEXT_TEXTURE_ALIGN_LEFT TEXT_TEXTURE_ALIGN_CENTER
 import pixel_display.true_color
+import pixel_display.true_color show get_rgb
 import pixel_display.histogram show TrueColorHistogram
 import font show *
 import font_x11_adobe.sans_10
@@ -89,40 +90,6 @@ fetch_prices:
     print "Sleep for $(ms / 1000) seconds"
     sleep --ms=ms
 
-// Task that updates the LEDs and power based on the current situation.
-control power/gpio.Pin? led/Led:
-  old_situation := null
-  while true:
-    sleep --ms=20
-    if situation != old_situation:
-      old_situation = situation
-      state := situation.state
-      price := situation.price
-      if state == ON:
-        if power: power.set POWER_ON
-        led.set 0.0 0.5 1.0 // Turquoise: Manual on.
-        print "Turquoise"
-      else if state == OFF:
-        if power: power.set POWER_OFF
-        led.set 1.0 0.0 1.0 // Purple: Manual off.
-        print "Purple"
-      else if price:
-        if price <= MAX_PRICE:
-          if power: power.set POWER_ON
-          led.set 0.0 0.5 0.0 // Green: Auto on.
-          print "Green"
-        else:
-          if power: power.set POWER_OFF
-          if price <= MAX_PRICE * 2:
-            led.set 1.0 0.2 0.0 // Orange: Auto off - medium price.
-            print "Orange"
-          else:
-            led.set 1.0 0.0 0.0 // Red: Auto off - expensive.
-            print "Red"
-      else:
-        led.set 0.0 0.0 0.0 // Black: No price, no manual override.
-        print "Black"
-
 ntp_counter/int := 0
 ntp_result := null
 
@@ -152,8 +119,8 @@ class Situation:
   display/TrueColorPixelDisplay
   current_hour/int? := null
 
-  green_histogram/TrueColorPixelDisplay
-  orange_histogram/TrueColorPixelDisplay
+  green_histogram/TrueColorHistogram
+  orange_histogram/TrueColorHistogram
   red_histogram/TrueColorHistogram
 
   tick_marks/List
@@ -162,11 +129,11 @@ class Situation:
   prices/List := []
 
   constructor .display:
-    context := display.context --landscape --color=WHITE --font=sans --alignment=TEXT_TEXTURE_ALIGN_CENTER
-    histo_transform = context.transform
-    green_histogram  = TrueColorHistogram HIST_X HIST_Y HIST_WIDTH HIST_HEIGHT histo_transform 1.0 (get_rgb 10 240 10)
-    orange_histogram = TrueColorHistogram HIST_X HIST_Y HIST_WIDTH HIST_HEIGHT histo_transform 1.0 (get_rgb 200 200 10)
-    red_histogram   = TrueColorHistogram HIST_X HIST_Y HIST_WIDTH HIST_HEIGHT histo_transform 1.0 (get_rgb 240 10 10)
+    context := display.context --landscape --color=true_color.WHITE --font=sans --alignment=TEXT_TEXTURE_ALIGN_CENTER
+    histo_transform := context.transform
+    green_histogram  = TrueColorHistogram HIST_LEFT HIST_TOP HIST_WIDTH HIST_HEIGHT histo_transform 1.0 (get_rgb 10 240 10)
+    orange_histogram = TrueColorHistogram HIST_LEFT HIST_TOP HIST_WIDTH HIST_HEIGHT histo_transform 1.0 (get_rgb 200 200 10)
+    red_histogram   = TrueColorHistogram HIST_LEFT HIST_TOP HIST_WIDTH HIST_HEIGHT histo_transform 1.0 (get_rgb 240 10 10)
     hours = List HIST_BARS / 3:
       display.text context -100 -100 ""
     tick_marks = List HIST_BARS / 3:
@@ -181,24 +148,25 @@ class Situation:
       label_index := 0
       min_price := 1000000.0
       max_price := -1000000.0
-      green_histogram.clear
+      /*green_histogram.clear
       orange_histogram.clear
-      red_histogram.clear
+      red_histogram.clear*/
       HIST_BARS.repeat: | i |
         if (i + current_hour) % 3 == 0:
           h := (i + current_hour) % 24
           hours[label_index].text = h.stringify
-          x := HIST_X + TICK_OFFSET + i * HIST_BAR_WIDTH
-          hours[label_index].move_to x LABEL_BOTTOM
-          tick_marks.move_to         x TICK_TOP
+          x := HIST_LEFT + TICK_OFFSET + i * HIST_BAR_WIDTH
+          hours[label_index].move_to      x LABEL_BOTTOM
+          tick_marks[label_index].move_to x TICK_TOP
           label_index++
         if i < new_prices.size:
           price := new_prices[i]
           min_price = min min_price price
           max_price = max max_price price
-        range := max_price - min_price
-        hist_min := min_prices - 20
-        hist_max := max_prices
+
+      range := max_price - min_price
+      hist_min := min_price - 20
+      hist_max := max_price
 
       new_prices.do: | price |
         selected_hist/TrueColorHistogram := ?
@@ -208,9 +176,9 @@ class Situation:
           selected_hist = orange_histogram
         else:
           selected_hist = red_histogram
-        zero_to_one = (price - hist_min) / (hist_max - hist_min).to_float
-        pixel_height = zero_to_one * HIST_HEIGHT
-        (HIST_BAR_WIDTH - HIST_BAR_PAD.repeat: selected_hist.add pixel_height
+        zero_to_one := (price - hist_min) / (hist_max - hist_min).to_float
+        pixel_height := zero_to_one * HIST_HEIGHT
+        (HIST_BAR_WIDTH - HIST_BAR_PAD).repeat: selected_hist.add pixel_height
         HIST_BAR_PAD.repeat: selected_hist.add 0.0
         HIST_BAR_WIDTH.repeat:
           if selected_hist != red_histogram: red_histogram.add 0.0
