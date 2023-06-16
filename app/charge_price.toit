@@ -41,10 +41,12 @@ TICK_OFFSET ::= (HIST_BAR_WIDTH - HIST_BAR_PAD) / 2
 
 main:
   set_timezone TIME_ZONE
-  task:: fetch_prices
+  display/TrueColorPixelDisplay := get_display LILYGO_16_BIT_LANDSCAPE_SETTINGS
+  ui := UserInterface display
+  task:: fetch_prices ui
 
 // Task that updates the price of electricity from an API.
-fetch_prices:
+fetch_prices ui/UserInterface:
   interface := net.open
   client := http.Client.tls interface
       --root_certificates=[CERT_ROOT]
@@ -73,15 +75,17 @@ fetch_prices:
           clear_ntp_adjustment
       if json_result:
         // The JSON is just an array of hourly prices.
+        prices := []
+        hour := local.h
         json_result.do: | period |
           start := Time.from_string period["time_start"]
           end := Time.from_string period["time_end"]
-          if start <= now < end:
+          if start <= now:
             price := period["$(CURRENCY)_per_kWh"]
-            situation = situation.update_price price
-            print "Electricity $(price_format price) $CURRENCY/kWh"
+            prices.add price
             // Successful fetch, so we can set the variable and not fetch again.
             today = new_today
+        ui.update hour prices
     // Random sleep to avoid hammering the server if it is down, or just after
     // midnight when we need to fetch a new day. This also avoids hammering the
     // grid with a huge power spike at the top of each hour (when there are
@@ -115,7 +119,7 @@ price_format price/num -> string:
     frac_part = 0
   return "$(int_part).$(%02d frac_part)"
 
-class Situation:
+class UserInterface:
   display/TrueColorPixelDisplay
   current_hour/int? := null
 
@@ -139,7 +143,7 @@ class Situation:
     tick_marks = List HIST_BARS / 3:
       display.filled_rectangle context -100 -100 1 10
 
-  update_prices new_current_hour/int new_prices/List -> none:
+  update new_current_hour/int new_prices/List -> none:
     if new_prices.size > HIST_BARS: new_prices = new_prices[..HIST_BARS]
     differ := false
     (min new_prices.size prices.size).repeat: if new_prices[it] != prices[it]: differ = true
