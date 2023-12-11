@@ -6,6 +6,7 @@ prefixes:
   font_x11_adobe: pkg-font-x11-adobe
   http: pkg-http
   ntp: pkg-ntp
+  pixel_display: toit-pixel-display
   roboto: toit-font-google-100dpi-roboto
 packages:
   pkg-font-tiny:

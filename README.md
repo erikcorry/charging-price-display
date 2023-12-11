@@ -1,4 +1,4 @@
-# Eco Power Swich
+# Electricity Price Display
 
 Program in [Toit](https://toitlang.org/) to show the electricty price for
 the next 12 hours in Denmark.  This is also a good
