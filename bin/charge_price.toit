@@ -2,190 +2,270 @@
 // Use of this source code is governed by a Zero-Clause BSD license that can
 // be found in the LICENSE file.
 
-import .get_display
+import .get-display
 
-import certificate_roots
+import certificate-roots
+import color-tft show *
 import encoding.json
 import http
 import ntp
 import net
-import pixel_display show *
-import pixel_display.texture show TEXT_TEXTURE_ALIGN_LEFT TEXT_TEXTURE_ALIGN_CENTER
-import pixel_display.true_color
-import pixel_display.true_color show get_rgb
-import pixel_display.histogram show TrueColorHistogram
+import pixel-display.element show *
+import pixel-display.gradient show *
+import pixel-display show *
+import pixel-display.slider show *
+import pixel-display.style show *
 import font show *
-import font_x11_adobe.sans_10
+import font-x11-adobe.sans-10-bold
 
-sans ::= Font [sans_10.ASCII]
+sans ::= Font [sans-10-bold.ASCII]
 
-MAX_PRICE ::= 0.61  // Maximum price to pay for power is 1.0 per kWh, but we pay 0.39 in taxes and transport.
-// API for current price (without VAT):
 HOST      ::= "www.elprisenligenu.dk"
 CURRENCY  ::= "DKK"
 // Get with: tail -n1 /usr/share/zoneinfo/Europe/Copenhagen 
-TIME_ZONE ::= "CET-1CEST,M3.5.0,M10.5.0/3"  // Time zone with daylight savings switching.
+TIME-ZONE ::= "CET-1CEST,M3.5.0,M10.5.0/3"  // Time zone with daylight savings switching.
 GEOGRAPHY ::= "DK1"  // DK1 is West of Storebælt, DK2 is East of Storebælt.
-CERT_ROOT ::= certificate_roots.ISRG_ROOT_X1
+CERT-ROOT ::= certificate-roots.ISRG-ROOT-X1
 
-LABEL_BOTTOM ::= 20
-TICK_TOP ::= 22
-HIST_LEFT ::= 60
-HIST_TOP ::= 35
-HIST_HEIGHT ::= 100
-HIST_BARS ::= 18
-HIST_BAR_WIDTH ::= 10
-HIST_WIDTH ::= HIST_BARS * HIST_BAR_WIDTH
-HIST_BAR_PAD ::= 2 // Gaps in bars.
-TICK_OFFSET ::= (HIST_BAR_WIDTH - HIST_BAR_PAD) / 2
+AFGIFT ::= 101  // øre/kWh
+
+// Transport fees in øre/kWh.
+TRANSPORT-FEES ::= [
+    15,  // midnight to 1am.
+    15,  // 1am to 2am.
+    15,  // 2am to 3am.
+    15,  // 3am to 4am.
+    15,  // 4am to 5am.
+    15,  // 5am to 6am.
+    46,  // 6am to 7am.
+    46,  // 7am to 8am.
+    46,  // 8am to 9am.
+    46,  // 9am to 10am.
+    46,  // 10am to 11am.
+    46,  // 11am to noon.
+    46,  // noon to 1pm.
+    46,  // 1pm to 2pm.
+    46,  // 2pm to 3pm.
+    46,  // 3pm to 4pm.
+    46,  // 4pm to 5pm.
+    138, // 5pm to 6pm.
+    138, // 6pm to 7pm.
+    138, // 7pm to 8pm.
+    128, // 8pm to 9pm.
+    46,  // 9pm to 10pm.
+    46,  // 10pm to 11pm.
+    46,  // 11pm to midnight.
+]
 
 main:
-  set_timezone TIME_ZONE
-  display/TrueColorPixelDisplay := get_display LILYGO_16_BIT_LANDSCAPE_SETTINGS
+  set-timezone TIME-ZONE
+  display/PixelDisplay := get-display M5-STACK-24-BIT-LANDSCAPE-SETTINGS
+  display.background = 0x808080
   ui := UserInterface display
-  task:: fetch_prices ui
+  fetcher := PriceFetcher ui
+  fetcher.run
 
-// Task that updates the price of electricity from an API.
-fetch_prices ui/UserInterface:
-  interface := net.open
-  client := http.Client.tls interface
-      --root_certificates=[CERT_ROOT]
-  today/string? := null
-  json_result/List? := null
+class HourPrice:
+  hour/Time
+  price/num
 
-  while true:
-    // Big catch for all intermittent network errors.
-    catch --trace:
-      now := get_now
+  constructor .hour .price:
+
+  operator == other:
+    if other is not HourPrice: return false
+    return hour == other.hour and price == other.price
+
+// Object that updates the price of electricity from an API.
+class PriceFetcher:
+  constructor .ui:
+    client = http.Client.tls network
+        --root-certificates=[CERT-ROOT]
+
+  ui/UserInterface
+  network := net.open
+  client/http.Client
+  today-string/string? := null
+  tomorrow-string/string? := null
+  today-prices/List? := null
+  tomorrow-prices/List? := null
+
+  run -> none:
+    now/Time? := null
+    while true:
+      new-now := get-now
+      if new-now: now = new-now
+      if not now: continue
+
       // The API lets you fetch one day, using the local time zone
       // to determine when the day starts and ends.
-      local := now.local
-      new_today := "$local.year/$(%02d local.month)-$(%02d local.day)"
-      // They don't normally update the hourly prices after the day
-      // started, so if we already have the prices for today, we
-      // don't need to fetch them again.
-      if new_today != today or not json_result:
-        path := "/api/v1/prices/$(new_today)_$(GEOGRAPHY).json"
-        print "Fetching $path"
-        response := client.get --host=HOST --path=path
-        if response.status_code == 200:
-          json_result = json.decode_stream response.body
-        else:
-          print "Response status code: $response.status_code"
-          clear_ntp_adjustment
-      if json_result:
-        // The JSON is just an array of hourly prices.
-        prices := []
-        hour := local.h
-        json_result.do: | period |
-          start := Time.from_string period["time_start"]
-          end := Time.from_string period["time_end"]
-          if start <= now:
-            price := period["$(CURRENCY)_per_kWh"]
-            prices.add price
-            // Successful fetch, so we can set the variable and not fetch again.
-            today = new_today
-        ui.update hour prices
-    // Random sleep to avoid hammering the server if it is down, or just after
-    // midnight when we need to fetch a new day. This also avoids hammering the
-    // grid with a huge power spike at the top of each hour (when there are
-    // millions using this program!).
-    ms := (random 100_000) + 100_000
-    print "Sleep for $(ms / 1000) seconds"
-    sleep --ms=ms
+      new-today-string := date-format now.local
+      tomorrow := now + (Duration --h=24)
+      new-tomorrow-string := date-format tomorrow.local
+      if new-today-string != today-string: today-prices = null
+      if new-tomorrow-string != tomorrow-string: tomorrow-prices = null
+      // Catch for all intermittent network errors.
+      catch --trace:
+        if not today-prices:
+          today-prices = get-prices new-today-string
+        if not tomorrow-prices:
+          tomorrow-prices = get-prices new-tomorrow-string
+      today-string = new-today-string
+      tomorrow-string = new-tomorrow-string
+      ui.update now today-prices tomorrow-prices
+      ms := (random 100_000) + 100_000
+      print "Sleep for $(ms / 1000) seconds"
+      sleep --ms=ms
 
-ntp_counter/int := 0
-ntp_result := null
+  get-prices date-string/string -> List?:
+    path := "/api/v1/prices/$(date-string)_$(GEOGRAPHY).json"
+    print "Fetching $path"
+    response := client.get --host=HOST --path=path
+    if response.status-code == 200:
+      data := json.decode-stream response.body
+      return interpret-json data
+    else:
+      print "Response status code: $response.status-code"
+      clear-ntp-adjustment
+      return null
 
-get_now -> Time:
-  // One time in 100 we bother the server for a new NTP adjustment.  Small
-  // devices might not have any other process fetching the NTP time.
-  if not ntp_result or ntp_counter % 100 == 0:
-    ntp_result = ntp.synchronize
-    print "Getting NTP adjustment $ntp_result.adjustment"
-  ntp_counter++
-  return Time.now + ntp_result.adjustment
+  /**
+  Takes the JSON data from the API and returns a list
+    of HourPrice objects.
+  */
+  interpret-json data -> List?:
+    if not data: return null
+    result := []
+    data.do: | period |
+      start := Time.parse period["time_start"]
+      end := Time.parse period["time_end"]
+      price := period["$(CURRENCY)_per_kWh"]
+      result.add
+          HourPrice start price
+    return result
 
-clear_ntp_adjustment -> none:
-  // Fetching the prices might have failed because our clock is wrong.  Let's
-  // try to get a new NTP adjustment next time.
-  ntp_result = null
+  static date-format date/TimeInfo -> string:
+    return "$date.year/$(%02d date.month)-$(%02d date.day)"
 
-price_format price/num -> string:
-  int_part := price.to_int
-  frac_part := ((price - int_part) * 100).round
-  if frac_part == 100:
-    int_part++
-    frac_part = 0
-  return "$(int_part).$(%02d frac_part)"
+  ntp-counter/int := 0
+  ntp-result := null
+  ntp-retry-timeout := 1000
+
+  get-now -> Time?:
+    // Catch for all intermittent network errors.
+    catch --trace:
+      // One time in 100 we bother the server for a new NTP adjustment.  Small
+      // devices might not have any other process fetching the NTP time.
+      if not ntp-result or ntp-counter % 100 == 0:
+        ntp-result = ntp.synchronize
+        ntp-retry-timeout = 1000
+        if ntp-result: print "Getting NTP adjustment $ntp-result.adjustment"
+      ntp-counter++
+      if ntp-result:
+        return Time.now + ntp-result.adjustment
+    ntp-retry-timeout *= 2
+    ntp-retry-timeout = max ntp-retry-timeout 300_000  // Max 5 minutes.
+    print "NTP sleep $(ntp-retry-timeout)ms"
+    sleep --ms=ntp-retry-timeout
+    return null
+
+  clear-ntp-adjustment -> none:
+    // Fetching the prices might have failed because our clock is wrong.  Let's
+    // try to get a new NTP adjustment next time.
+    ntp-result = null
 
 class UserInterface:
-  display/TrueColorPixelDisplay
-  current_hour/int? := null
+  display/PixelDisplay
 
-  green_histogram/TrueColorHistogram
-  orange_histogram/TrueColorHistogram
-  red_histogram/TrueColorHistogram
-
-  tick_marks/List
-  hours/List
-
-  prices/List := []
+  sliders/List := []
+  labels/List := []
 
   constructor .display:
-    context := display.context --landscape --color=true_color.WHITE --font=sans --alignment=TEXT_TEXTURE_ALIGN_CENTER
-    histo_transform := context.transform
-    green_histogram  = TrueColorHistogram HIST_LEFT HIST_TOP HIST_WIDTH HIST_HEIGHT histo_transform 1.0 (get_rgb 10 240 10)
-    orange_histogram = TrueColorHistogram HIST_LEFT HIST_TOP HIST_WIDTH HIST_HEIGHT histo_transform 1.0 (get_rgb 200 200 10)
-    red_histogram   = TrueColorHistogram HIST_LEFT HIST_TOP HIST_WIDTH HIST_HEIGHT histo_transform 1.0 (get_rgb 240 10 10)
-    hours = List HIST_BARS / 3:
-      display.text context -100 -100 ""
-    tick_marks = List HIST_BARS / 3:
-      display.filled_rectangle context -100 -100 1 10
+    div := Div --x=0 --y=0 --w=display.width --h=display.height --classes=["bg-div"]
+    display.add div
 
-  update new_current_hour/int new_prices/List -> none:
-    if new_prices.size > HIST_BARS: new_prices = new_prices[..HIST_BARS]
-    differ := false
-    (min new_prices.size prices.size).repeat: if new_prices[it] != prices[it]: differ = true
-    if new_prices.size != prices.size or differ or new_current_hour != current_hour:
-      current_hour = new_current_hour
-      label_index := 0
-      min_price := 1000000.0
-      max_price := -1000000.0
-      /*green_histogram.clear
-      orange_histogram.clear
-      red_histogram.clear*/
-      HIST_BARS.repeat: | i |
-        if (i + current_hour) % 3 == 0:
-          h := (i + current_hour) % 24
-          hours[label_index].text = h.stringify
-          x := HIST_LEFT + TICK_OFFSET + i * HIST_BAR_WIDTH
-          hours[label_index].move_to      x LABEL_BOTTOM
-          tick_marks[label_index].move_to x TICK_TOP
-          label_index++
-        if i < new_prices.size:
-          price := new_prices[i]
-          min_price = min min_price price
-          max_price = max max_price price
+    13.repeat:
+      slider := Slider --x=(10 + it * 20) --y=0
+      sliders.add slider
+      div.add slider
+      label := Label --x=(19 + it * 20) --classes=["slider-label"]
+      labels.add label
+      div.add label
 
-      range := max_price - min_price
-      hist_min := min_price - 20
-      hist_max := max_price
+    4.repeat:
+      div.add
+          Div --id="price-line-$it" --classes=["price-line"]
+      div.add
+          Label --id="price-label-$it" --classes=["price-label"]
 
-      new_prices.do: | price |
-        selected_hist/TrueColorHistogram := ?
-        if price <= min_price + range / 3:
-          selected_hist = green_histogram
-        else if price <= min_price + 2 * range / 3:
-          selected_hist = orange_histogram
-        else:
-          selected_hist = red_histogram
-        zero_to_one := (price - hist_min) / (hist_max - hist_min).to_float
-        pixel_height := zero_to_one * HIST_HEIGHT
-        (HIST_BAR_WIDTH - HIST_BAR_PAD).repeat: selected_hist.add pixel_height
-        HIST_BAR_PAD.repeat: selected_hist.add 0.0
-        HIST_BAR_WIDTH.repeat:
-          if selected_hist != red_histogram: red_histogram.add 0.0
-          if selected_hist != orange_histogram: orange_histogram.add 0.0
-          if selected_hist != green_histogram: green_histogram.add 0.0
-      display.draw
+    // These non-orthogonal gradients are pretty slow.  You can make
+    // it faster by setting the angle to 180, or by using a single
+    // color like 0xe0e0ff.
+    background := GradientBackground --angle=150 --specifiers=[
+        GradientSpecifier --color=0xf0f0ff 0,
+        GradientSpecifier --color=0xb0b0df 100,
+    ]
+
+    price-gradient := GradientBackground --angle=0 --specifiers=[
+        GradientSpecifier --color=0x00ff00 0,
+        GradientSpecifier --color=0xffff00 40,
+        GradientSpecifier --color=0xff0000 100,
+    ]
+
+    style := Style
+        --type-map={
+            "slider": Style --y=0 --w=18 --h=200 {
+                "background-hi": price-gradient,
+                "max": 400,
+            },
+        }
+        --class-map={
+            "bg-div": Style --background=background,
+            "price-line": Style --x=5 --w=310 --h=1 --background=0x404040,
+            "price-label": Style --x=305 --color=0x404040 --font=sans {
+                "alignment": ALIGN-RIGHT,
+            },
+            "slider-label": Style --y=215 --font=sans --color=0 {
+                "alignment": ALIGN-CENTER,
+            },
+        }
+        --id-map={
+            "price-line-0": Style --y=50,
+            "price-line-1": Style --y=100,
+            "price-line-2": Style --y=150,
+            "price-line-3": Style --y=200,
+            "price-label-0": Style --y=215 { "label": "0kr"},
+            "price-label-1": Style --y=165 { "label": "1kr"},
+            "price-label-2": Style --y=115 { "label": "2kr"},
+            "price-label-3": Style --y=65 { "label": "3kr"},
+        }
+    display.set-styles [style]
+
+  update now/Time today-prices/List? tomorrow-prices/List? -> none:
+    hour-now/TimeInfo := now.local.with --m=0 --s=0 --ns=0
+    start-of-this-hour/Time := hour-now.time
+    hour-number := hour-now.h
+    i := 0
+    if not today-prices: today-prices = []
+    if not tomorrow-prices: tomorrow-prices = []
+    (today-prices + tomorrow-prices).do: | hour-price/HourPrice |
+      if hour-price.hour >= start-of-this-hour and i < sliders.size:
+        label := (hour-number + i) % 24
+        price := hour-price.price * 100.to-int
+        price += TRANSPORT-FEES[label]
+        price += AFGIFT
+        sliders[i].value = price
+        labels[i].label = "$(label == 0 ? 24 : label)"
+        i++
+    while i < sliders.size:
+      sliders[i].value = 0
+      labels[i].label = ""
+      i++
+    display.draw
+
+  static price-format price/num -> string:
+    int-part := price.to-int
+    frac-part := ((price - int-part) * 100).round
+    if frac-part == 100:
+      int-part++
+      frac-part = 0
+    return "$(int-part).$(%02d frac-part)"
